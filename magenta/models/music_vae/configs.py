@@ -465,7 +465,7 @@ CONFIG_MAP['hierdec-trio_4bar'] = Config(
     hparams=merge_hparams(
         lstm_models.get_default_hparams(),
         HParams(
-            batch_size=128,
+            batch_size=32,
             max_seq_len=64,
             z_size=512,
             enc_rnn_size=[1024, 1024],
@@ -480,6 +480,50 @@ CONFIG_MAP['hierdec-trio_4bar'] = Config(
     signatures=['sample', 'interpolate'],
     architecture_name='music_vae',
     ns_converter_name='trio_4bar_converter'
+)
+
+quartet_4bar_converter = data.QuartetConverter(
+    steps_per_quarter=4,
+    slice_bars=4,
+    gap_bars=2)
+
+CONFIG_MAP['hier-quartet_4bar'] = Config(
+    model=MusicVAE(
+        lstm_models.HierarchicalLstmEncoder(
+            lstm_models.BidirectionalLstmEncoder, [8, 8]),
+        lstm_models.HierarchicalLstmDecoder(
+            lstm_models.SplitMultiOutLstmDecoder(
+                core_decoders=[
+                    lstm_models.CategoricalLstmDecoder(),
+                    lstm_models.CategoricalLstmDecoder(),
+                    lstm_models.CategoricalLstmDecoder(),
+                    lstm_models.CategoricalLstmDecoder()],
+                output_depths=[
+                    90,  # synth
+                    90,  # melody
+                    90,  # bass
+                    512,  # drums
+                ]),
+            level_lengths=[8, 8],
+            disable_autoregression=True)),
+    hparams=merge_hparams(
+        lstm_models.get_default_hparams(),
+        HParams(
+            batch_size=32,
+            max_seq_len=64,
+            z_size=512,
+            enc_rnn_size=[1024],
+            dec_rnn_size=[512, 512],
+            free_bits=256,
+            max_beta=0.2,
+        )),
+    note_sequence_augmenter=None,
+    data_converter=quartet_4bar_converter,
+    train_examples_path=None,
+    eval_examples_path=None,
+    signatures=['sample', 'interpolate'],
+    architecture_name='music_vae',
+    ns_converter_name='quartet_4bar_converter'
 )
 
 

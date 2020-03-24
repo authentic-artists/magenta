@@ -174,6 +174,7 @@ def export_config_metadata(config, output_dir):
 
 
 if __name__ == '__main__':
+    print(configs.CONFIG_MAP)
     if FLAGS.config not in configs.CONFIG_MAP:
         raise ValueError('Invalid config name: %s' % FLAGS.config)
     config = configs.CONFIG_MAP[FLAGS.config]
