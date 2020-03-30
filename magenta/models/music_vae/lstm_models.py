@@ -206,6 +206,7 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
     return self._hierarchical_encoders[l][1]
 
   def build(self, hparams, is_training=True):
+    print("BUILDING A HIERARCHICAL_DECODER")
     self._total_length = hparams.max_seq_len
     if self._total_length != np.prod(self._level_lengths):
       raise ValueError(
@@ -228,6 +229,8 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
           name_or_scope=tf.VariableScope(
               tf.AUTO_REUSE, 'encoder/hierarchical_level_%d' % i))
       self._hierarchical_encoders.append((num_splits, h_encoder))
+      print("LEVEL_LENGTHS: ", self._level_lengths)
+      print("HIERARCHICAL_ENCODERS", self._hierarchical_encoders)
 
   def encode(self, sequence, sequence_length):
     """Hierarchically encodes the input sequences, returning a single embedding.
@@ -236,6 +239,7 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
     three segments [1, 2, 3], [4, 5], [6, 7, 8 ,9] and a `max_seq_len` of 12
     should be input as `sequence = [1, 2, 3, 0, 4, 5, 0, 0, 6, 7, 8, 9]` with
     `sequence_length = [3, 2, 4]`.
+
 
     Args:
       sequence: A batch of (padded) sequences, sizeds
@@ -257,7 +261,8 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
 
     for level, (num_splits, h_encoder) in enumerate(
         self._hierarchical_encoders):
-      split_seqs = tf.split(sequence, num_splits, axis=1)
+      print("calling tf split with args: ", sequence, type(num_splits), num_splits)
+      split_seqs = tf.split(sequence, int(num_splits), axis=1)
       # In the first level, we use the input `sequence_length`. After that,
       # we use the full embedding sequences.
       if level:
@@ -1366,4 +1371,3 @@ class GrooveLstmDecoder(BaseLstmDecoder):
 
     output_hits = hits_sampler.sample()
     return tf.concat([output_hits, output_velocities, output_offsets], axis=1)
-

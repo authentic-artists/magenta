@@ -117,6 +117,7 @@ def _trial_summary(hparams, examples_path, output_dir):
 
 def _get_input_tensors(dataset, config):
   """Get input tensors from dataset."""
+  print("fetching input tensors for training")
   batch_size = config.hparams.batch_size
   iterator = dataset.make_one_shot_iterator()
   (input_sequence, output_sequence, control_sequence,
@@ -132,12 +133,14 @@ def _get_input_tensors(dataset, config):
         [batch_size, None, config.data_converter.control_depth])
   sequence_length.set_shape([batch_size] + sequence_length.shape[1:].as_list())
 
-  return {
+  input_tensors = {
       'input_sequence': input_sequence,
       'output_sequence': output_sequence,
       'control_sequence': control_sequence,
       'sequence_length': sequence_length
   }
+  print("INPUT_TENSORS:", input_tensors)
+  return input_tensors
 
 
 def train(train_dir,
@@ -166,6 +169,7 @@ def train(train_dir,
                   is_training=True)
 
       optimizer = model.train(**_get_input_tensors(dataset_fn(), config))
+
 
       hooks = []
       if num_sync_workers:
@@ -295,12 +299,15 @@ def run(config_map,
     raise ValueError('Invalid mode: {}'.format(FLAGS.mode))
 
   def dataset_fn():
-    return data.get_dataset(
+    print("FETCHING DATASET")
+    dataset = data.get_dataset(
         config,
         tf_file_reader=tf_file_reader,
         num_threads=FLAGS.num_data_threads,
         is_training=is_training,
         cache_dataset=FLAGS.cache_dataset)
+    print("DATASET:", dataset)
+    return dataset
 
   if is_training:
     train(

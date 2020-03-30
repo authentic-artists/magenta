@@ -44,7 +44,7 @@ MIDI_PITCHES = 128
 MAX_INSTRUMENT_NUMBER = 127
 
 MEL_PROGRAMS = range(0, 32)  # piano, chromatic percussion, organ, guitar
-CMEL_PROGRAMS = range(50, 50)
+CMEL_PROGRAMS = range(50, 51)
 BASS_PROGRAMS = range(32, 40)
 ELECTRIC_BASS_PROGRAM = 33
 
@@ -1072,8 +1072,10 @@ class TrioConverter(BaseNoteSequenceConverter):
             if type_ not in (self.InstrumentType.UNK, self.InstrumentType.INVALID):
                 instruments_by_type[type_].append(i)
         if len(instruments_by_type) < 3:
+            print("This one is a bad boy")
             # This NoteSequence doesn't have all 3 types.
             return ConverterTensors()
+        print("This one is a good boy")
 
         # Encode individual instruments.
         # Set total time so that instruments will be padded correctly.
@@ -1225,6 +1227,7 @@ def get_dataset(
         config.note_sequence_augmenter if is_training else None)
     data_converter = config.data_converter
     data_converter.set_mode('train' if is_training else 'eval')
+    print("CREATING DATASET, example_path: ", examples_path)
 
     if examples_path:
         tf.logging.info('Reading examples from file: %s', examples_path)
@@ -1238,6 +1241,7 @@ def get_dataset(
                 tf_file_reader,
                 cycle_length=num_threads,
                 sloppy=is_training))
+        print("LOADED DATASET FROM PATH:", dataset, type(dataset))
     elif config.tfds_name:
         tf.logging.info('Reading examples from TFDS: %s', config.tfds_name)
         dataset = tfds.load(
@@ -1851,10 +1855,12 @@ class QuartetConverter(BaseNoteSequenceConverter):
         return instruments_by_type, instrument_type, coverage
 
     def _encode_instruments(self, note_sequence, total_bars, instruments_by_type, coverage):
+        print("ENCODING INSTRUMENTS")
         note_sequence.total_time = (
                     total_bars * self._steps_per_bar * 60 / note_sequence.tempos[0].qpm / self._steps_per_quarter)
         encoded_instruments = {}
         encoded_chords = None
+        print("Instruments by type:", instruments_by_type)
         for i in (instruments_by_type[self.InstrumentType.CMEL] +
                   instruments_by_type[self.InstrumentType.MEL] +
                   instruments_by_type[self.InstrumentType.BASS]):
@@ -1937,9 +1943,11 @@ class QuartetConverter(BaseNoteSequenceConverter):
 
         if len(instruments_by_type) < 4:
             # This NoteSequence doesn't have all four voice types.
+            print("This one is a super naughty boy!")
             return ConverterTensors()
+        print("This one is a super good boy!")
 
-        encoded_instruments, encoded_chords = self._encode_instruments(note_sequence, total_bars, instrument_type,
+        encoded_instruments, encoded_chords = self._encode_instruments(note_sequence, total_bars, instruments_by_type,
                                                                        coverage)
 
         og_coverage = coverage.copy()
