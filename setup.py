@@ -60,8 +60,8 @@ REQUIRED_PACKAGES = [
     'sk-video',
     'sonnet',
     'sox >= 1.3.7',
-    'tensorflow-datasets >= 1.0.2',
-    'tensorflow-probability == 0.7.0rc0',
+    'tensorflow-datasets == 1.0.2',
+    'tensorflow-probability == 0.7.0',
     'tensor2tensor >= 1.13.4',
     'wheel',
     'futures;python_version=="2.7"',
@@ -69,9 +69,9 @@ REQUIRED_PACKAGES = [
 ]
 
 if gpu_mode:
-  REQUIRED_PACKAGES.append('tensorflow-gpu >= 1.14.0')
+  REQUIRED_PACKAGES.append('tensorflow-gpu == 1.14.0')
 else:
-  REQUIRED_PACKAGES.append('tensorflow >= 1.14.0')
+  REQUIRED_PACKAGES.append('tensorflow == 1.14.0')
 
 # pylint:disable=line-too-long
 CONSOLE_SCRIPTS = [
