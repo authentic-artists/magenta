@@ -238,7 +238,7 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
     `sequence_length = [3, 2, 4]`.
 
     Args:
-      sequence: A batch of (padded) sequences, sized
+      sequence: A batch of (padded) sequences, sizeds
         `[batch_size, max_seq_len, input_depth]`.
       sequence_length: A batch of sequence lengths. May be sized
         `[batch_size, level_lengths[0]]` or `[batch_size]`. If the latter,
@@ -249,6 +249,7 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
     Returns:
       embedding: A batch of embeddings, sized `[batch_size, N]`.
     """
+    print("Encoding gangsta shit, DAT STATE: ", self._hierarchical_encoders)
     batch_size = sequence.shape[0].value
     sequence_length = lstm_utils.maybe_split_sequence_lengths(
         sequence_length, np.prod(self._level_lengths[1:]),
