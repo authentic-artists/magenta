@@ -937,235 +937,6 @@ class DrumsConverter(BaseNoteSequenceConverter):
         return output_sequences
 
 
-class TrioConverter(BaseNoteSequenceConverter):
-    """Converts to/from 3-part (mel, drums, bass) multi-one-hot events.
-
-    Extracts overlapping segments with melody, drums, and bass (determined by
-    program number) and concatenates one-hot tensors from OneHotMelodyConverter
-    and OneHotDrumsConverter. Takes the cross products from the sets of
-    instruments of each type.
-
-    Args:
-      slice_bars: Optional size of window to slide over full converted tensor.
-      gap_bars: The number of consecutive empty bars to allow for any given
-        instrument. Note that this number is effectively doubled for internal
-        gaps.
-      max_bars: Optional maximum number of bars per extracted sequence, before
-        slicing.
-      steps_per_quarter: The number of quantization steps per quarter note.
-      quarters_per_bar: The number of quarter notes per bar.
-      max_tensors_per_notesequence: The maximum number of outputs to return
-        for each NoteSequence.
-      chord_encoding: An instantiated OneHotEncoding object to use for encoding
-        chords on which to condition, or None if not conditioning on chords.
-    """
-
-    class InstrumentType(object):
-        UNK = 0
-        MEL = 1
-        BASS = 2
-        DRUMS = 3
-        INVALID = 4
-
-    def __init__(
-            self, slice_bars=None, gap_bars=2, max_bars=1024, steps_per_quarter=4,
-            quarters_per_bar=4, max_tensors_per_notesequence=5, chord_encoding=None):
-        self._melody_converter = OneHotMelodyConverter(
-            gap_bars=None, steps_per_quarter=steps_per_quarter,
-            pad_to_total_time=True, presplit_on_time_changes=False,
-            max_tensors_per_notesequence=None, chord_encoding=chord_encoding)
-        self._drums_converter = DrumsConverter(
-            gap_bars=None, steps_per_quarter=steps_per_quarter,
-            pad_to_total_time=True, presplit_on_time_changes=False,
-            max_tensors_per_notesequence=None)
-        self._slice_bars = slice_bars
-        self._gap_bars = gap_bars
-        self._max_bars = max_bars
-        self._steps_per_quarter = steps_per_quarter
-        self._steps_per_bar = steps_per_quarter * quarters_per_bar
-        self._chord_encoding = chord_encoding
-
-        self._split_output_depths = (
-            self._melody_converter.output_depth,
-            self._melody_converter.output_depth,
-            self._drums_converter.output_depth)
-        output_depth = sum(self._split_output_depths)
-
-        self._program_map = dict(
-            [(i, TrioConverter.InstrumentType.MEL) for i in MEL_PROGRAMS] +
-            [(i, TrioConverter.InstrumentType.BASS) for i in BASS_PROGRAMS])
-
-        super(TrioConverter, self).__init__(
-            input_depth=output_depth,
-            input_dtype=np.bool,
-            output_depth=output_depth,
-            output_dtype=np.bool,
-            control_depth=self._melody_converter.control_depth,
-            control_dtype=self._melody_converter.control_dtype,
-            end_token=False,
-            presplit_on_time_changes=True,
-            max_tensors_per_notesequence=max_tensors_per_notesequence)
-
-    def _to_tensors(self, note_sequence):
-        try:
-            quantized_sequence = mm.quantize_note_sequence(
-                note_sequence, self._steps_per_quarter)
-            if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
-                    self._steps_per_bar):
-                return ConverterTensors()
-        except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
-                mm.NegativeTimeError):
-            return ConverterTensors()
-
-        if self._chord_encoding and not any(
-                ta.annotation_type == CHORD_SYMBOL
-                for ta in quantized_sequence.text_annotations):
-            # We are conditioning on chords but sequence does not have chords. Try to
-            # infer them.
-            try:
-                mm.infer_chords_for_sequence(quantized_sequence)
-            except mm.ChordInferenceError:
-                return ConverterTensors()
-
-            # The trio parts get extracted from the original NoteSequence, so copy the
-            # inferred chords back to that one.
-            for qta in quantized_sequence.text_annotations:
-                if qta.annotation_type == CHORD_SYMBOL:
-                    ta = note_sequence.text_annotations.add()
-                    ta.annotation_type = CHORD_SYMBOL
-                    ta.time = qta.time
-                    ta.text = qta.text
-
-        total_bars = int(
-            np.ceil(quantized_sequence.total_quantized_steps / self._steps_per_bar))
-        total_bars = min(total_bars, self._max_bars)
-
-        # Assign an instrument class for each instrument, and compute its coverage.
-        # If an instrument has multiple classes, it is considered INVALID.
-        instrument_type = np.zeros(MAX_INSTRUMENT_NUMBER + 1, np.uint8)
-        coverage = np.zeros((total_bars, MAX_INSTRUMENT_NUMBER + 1), np.bool)
-        for note in quantized_sequence.notes:
-            i = note.instrument
-            if i > MAX_INSTRUMENT_NUMBER:
-                tf.logging.warning('Skipping invalid instrument number: %d', i)
-                continue
-            if note.is_drum:
-                inferred_type = self.InstrumentType.DRUMS
-            else:
-                inferred_type = self._program_map.get(
-                    note.program, self.InstrumentType.INVALID)
-            if not instrument_type[i]:
-                instrument_type[i] = inferred_type
-            elif instrument_type[i] != inferred_type:
-                instrument_type[i] = self.InstrumentType.INVALID
-
-            start_bar = note.quantized_start_step // self._steps_per_bar
-            end_bar = int(np.ceil(note.quantized_end_step / self._steps_per_bar))
-
-            if start_bar >= total_bars:
-                continue
-            coverage[start_bar:min(end_bar, total_bars), i] = True
-
-        # Group instruments by type.
-        instruments_by_type = collections.defaultdict(list)
-        for i, type_ in enumerate(instrument_type):
-            if type_ not in (self.InstrumentType.UNK, self.InstrumentType.INVALID):
-                instruments_by_type[type_].append(i)
-        if len(instruments_by_type) < 3:
-            # This NoteSequence doesn't have all 3 types.
-            return ConverterTensors()
-
-        # Encode individual instruments.
-        # Set total time so that instruments will be padded correctly.
-        note_sequence.total_time = (
-                total_bars * self._steps_per_bar *
-                60 / note_sequence.tempos[0].qpm / self._steps_per_quarter)
-        encoded_instruments = {}
-        encoded_chords = None
-        for i in (instruments_by_type[self.InstrumentType.MEL] +
-                  instruments_by_type[self.InstrumentType.BASS]):
-            tensors = self._melody_converter.to_tensors(
-                _extract_instrument(note_sequence, i))
-            if tensors.outputs:
-                encoded_instruments[i] = tensors.outputs[0]
-                if encoded_chords is None:
-                    encoded_chords = tensors.controls[0]
-                elif not np.array_equal(encoded_chords, tensors.controls[0]):
-                    tf.logging.warning('Trio chords disagreement between instruments.')
-            else:
-                coverage[:, i] = False
-        for i in instruments_by_type[self.InstrumentType.DRUMS]:
-            tensors = self._drums_converter.to_tensors(
-                _extract_instrument(note_sequence, i))
-            if tensors.outputs:
-                encoded_instruments[i] = tensors.outputs[0]
-            else:
-                coverage[:, i] = False
-
-        # Fill in coverage gaps up to self._gap_bars.
-        og_coverage = coverage.copy()
-        for j in range(total_bars):
-            coverage[j] = np.any(
-                og_coverage[
-                max(0, j - self._gap_bars):min(total_bars, j + self._gap_bars) + 1],
-                axis=0)
-
-        # Take cross product of instruments from each class and compute combined
-        # encodings where they overlap.
-        seqs = []
-        control_seqs = []
-        for grp in itertools.product(
-                instruments_by_type[self.InstrumentType.MEL],
-                instruments_by_type[self.InstrumentType.BASS],
-                instruments_by_type[self.InstrumentType.DRUMS]):
-            # Consider an instrument covered within gap_bars from the end if any of
-            # the other instruments are. This allows more leniency when re-encoding
-            # slices.
-            grp_coverage = np.all(coverage[:, grp], axis=1)
-            grp_coverage[:self._gap_bars] = np.any(coverage[:self._gap_bars, grp])
-            grp_coverage[-self._gap_bars:] = np.any(coverage[-self._gap_bars:, grp])
-            for j in range(total_bars - self._slice_bars + 1):
-                if (np.all(grp_coverage[j:j + self._slice_bars]) and
-                        all(i in encoded_instruments for i in grp)):
-                    start_step = j * self._steps_per_bar
-                    end_step = (j + self._slice_bars) * self._steps_per_bar
-                    seqs.append(np.concatenate(
-                        [encoded_instruments[i][start_step:end_step] for i in grp],
-                        axis=-1))
-                    if encoded_chords is not None:
-                        control_seqs.append(encoded_chords[start_step:end_step])
-
-        return ConverterTensors(inputs=seqs, outputs=seqs, controls=control_seqs)
-
-    def _to_notesequences(self, samples, controls=None):
-        print("Printing samples array shape: ", samples.shape)
-        output_sequences = []
-        dim_ranges = np.cumsum(self._split_output_depths)
-        print(dim_ranges)
-        for i, s in enumerate(samples):
-            mel_ns = self._melody_converter.to_notesequences(
-                [s[:, :dim_ranges[0]]],
-                [controls[i]] if controls is not None else None)[0]
-            bass_ns = self._melody_converter.to_notesequences(
-                [s[:, dim_ranges[0]:dim_ranges[1]]])[0]
-            drums_ns = self._drums_converter.to_notesequences(
-                [s[:, dim_ranges[1]:]])[0]
-
-            for n in bass_ns.notes:
-                n.instrument = 1
-                n.program = ELECTRIC_BASS_PROGRAM
-            for n in drums_ns.notes:
-                n.instrument = 9
-
-            ns = mel_ns
-            ns.notes.extend(bass_ns.notes)
-            ns.notes.extend(drums_ns.notes)
-            ns.total_time = max(
-                mel_ns.total_time, bass_ns.total_time, drums_ns.total_time)
-            output_sequences.append(ns)
-        return output_sequences
-
-
 def count_examples(examples_path, tfds_name, data_converter,
                    file_reader=tf.python_io.tf_record_iterator):
     """Counts the number of examples produced by the converter from files."""
@@ -1218,6 +989,7 @@ def get_dataset(
     Raises:
       ValueError: If no files match examples path.
     """
+    print("CREATING TRAINING DATASET")
     batch_size = config.hparams.batch_size
     examples_path = (
         config.train_examples_path if is_training else config.eval_examples_path)
@@ -1225,6 +997,7 @@ def get_dataset(
         config.note_sequence_augmenter if is_training else None)
     data_converter = config.data_converter
     data_converter.set_mode('train' if is_training else 'eval')
+    print("Loading examples at: ", examples_path)
 
     if examples_path:
         tf.logging.info('Reading examples from file: %s', examples_path)
@@ -1238,6 +1011,7 @@ def get_dataset(
                 tf_file_reader,
                 cycle_length=num_threads,
                 sloppy=is_training))
+        print("LOADED DATASET FROM PATH: ", dataset, type(dataset))
     elif config.tfds_name:
         tf.logging.info('Reading examples from TFDS: %s', config.tfds_name)
         dataset = tfds.load(
@@ -1766,10 +1540,240 @@ class GrooveConverter(BaseNoteSequenceConverter):
         return output_sequences
 
 
+class TrioConverter(BaseNoteSequenceConverter):
+    """Converts to/from 3-part (mel, drums, bass) multi-one-hot events.
+
+    Extracts overlapping segments with melody, drums, and bass (determined by
+    program number) and concatenates one-hot tensors from OneHotMelodyConverter
+    and OneHotDrumsConverter. Takes the cross products from the sets of
+    instruments of each type.
+
+    Args:
+      slice_bars: Optional size of window to slide over full converted tensor.
+      gap_bars: The number of consecutive empty bars to allow for any given
+        instrument. Note that this number is effectively doubled for internal
+        gaps.
+      max_bars: Optional maximum number of bars per extracted sequence, before
+        slicing.
+      steps_per_quarter: The number of quantization steps per quarter note.
+      quarters_per_bar: The number of quarter notes per bar.
+      max_tensors_per_notesequence: The maximum number of outputs to return
+        for each NoteSequence.
+      chord_encoding: An instantiated OneHotEncoding object to use for encoding
+        chords on which to condition, or None if not conditioning on chords.
+    """
+
+    class InstrumentType(object):
+        UNK = 0
+        MEL = 1
+        BASS = 2
+        DRUMS = 3
+        INVALID = 4
+
+    def __init__(
+            self, slice_bars=None, gap_bars=2, max_bars=1024, steps_per_quarter=4,
+            quarters_per_bar=4, max_tensors_per_notesequence=5, chord_encoding=None):
+        self._melody_converter = OneHotMelodyConverter(
+            gap_bars=None, steps_per_quarter=steps_per_quarter,
+            pad_to_total_time=True, presplit_on_time_changes=False,
+            max_tensors_per_notesequence=None, chord_encoding=chord_encoding)
+        self._drums_converter = DrumsConverter(
+            gap_bars=None, steps_per_quarter=steps_per_quarter,
+            pad_to_total_time=True, presplit_on_time_changes=False,
+            max_tensors_per_notesequence=None)
+        self._slice_bars = slice_bars
+        self._gap_bars = gap_bars
+        self._max_bars = max_bars
+        self._steps_per_quarter = steps_per_quarter
+        self._steps_per_bar = steps_per_quarter * quarters_per_bar
+        self._chord_encoding = chord_encoding
+
+        self._split_output_depths = (
+            self._melody_converter.output_depth,
+            self._melody_converter.output_depth,
+            self._drums_converter.output_depth)
+        output_depth = sum(self._split_output_depths)
+
+        self._program_map = dict(
+            [(i, TrioConverter.InstrumentType.MEL) for i in MEL_PROGRAMS] +
+            [(i, TrioConverter.InstrumentType.BASS) for i in BASS_PROGRAMS])
+
+        super(TrioConverter, self).__init__(
+            input_depth=output_depth,
+            input_dtype=np.bool,
+            output_depth=output_depth,
+            output_dtype=np.bool,
+            control_depth=self._melody_converter.control_depth,
+            control_dtype=self._melody_converter.control_dtype,
+            end_token=False,
+            presplit_on_time_changes=True,
+            max_tensors_per_notesequence=max_tensors_per_notesequence)
+
+    def _to_tensors(self, note_sequence):
+        try:
+            quantized_sequence = mm.quantize_note_sequence(
+                note_sequence, self._steps_per_quarter)
+            if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
+                    self._steps_per_bar):
+                return ConverterTensors()
+        except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
+                mm.NegativeTimeError):
+            return ConverterTensors()
+
+        if self._chord_encoding and not any(
+                ta.annotation_type == CHORD_SYMBOL
+                for ta in quantized_sequence.text_annotations):
+            # We are conditioning on chords but sequence does not have chords. Try to
+            # infer them.
+            try:
+                mm.infer_chords_for_sequence(quantized_sequence)
+            except mm.ChordInferenceError:
+                return ConverterTensors()
+
+            # The trio parts get extracted from the original NoteSequence, so copy the
+            # inferred chords back to that one.
+            for qta in quantized_sequence.text_annotations:
+                if qta.annotation_type == CHORD_SYMBOL:
+                    ta = note_sequence.text_annotations.add()
+                    ta.annotation_type = CHORD_SYMBOL
+                    ta.time = qta.time
+                    ta.text = qta.text
+
+        total_bars = int(
+            np.ceil(quantized_sequence.total_quantized_steps / self._steps_per_bar))
+        total_bars = min(total_bars, self._max_bars)
+
+        # Assign an instrument class for each instrument, and compute its coverage.
+        # If an instrument has multiple classes, it is considered INVALID.
+        instrument_type = np.zeros(MAX_INSTRUMENT_NUMBER + 1, np.uint8)
+        coverage = np.zeros((total_bars, MAX_INSTRUMENT_NUMBER + 1), np.bool)
+        for note in quantized_sequence.notes:
+            i = note.instrument
+            if i > MAX_INSTRUMENT_NUMBER:
+                tf.logging.warning('Skipping invalid instrument number: %d', i)
+                continue
+            if note.is_drum:
+                inferred_type = self.InstrumentType.DRUMS
+            else:
+                inferred_type = self._program_map.get(
+                    note.program, self.InstrumentType.INVALID)
+            if not instrument_type[i]:
+                instrument_type[i] = inferred_type
+            elif instrument_type[i] != inferred_type:
+                instrument_type[i] = self.InstrumentType.INVALID
+
+            start_bar = note.quantized_start_step // self._steps_per_bar
+            end_bar = int(np.ceil(note.quantized_end_step / self._steps_per_bar))
+
+            if start_bar >= total_bars:
+                continue
+            coverage[start_bar:min(end_bar, total_bars), i] = True
+
+        # Group instruments by type.
+        instruments_by_type = collections.defaultdict(list)
+        for i, type_ in enumerate(instrument_type):
+            if type_ not in (self.InstrumentType.UNK, self.InstrumentType.INVALID):
+                instruments_by_type[type_].append(i)
+        if len(instruments_by_type) < 3:
+            # This NoteSequence doesn't have all 3 types.
+            return ConverterTensors()
+
+        # Encode individual instruments.
+        # Set total time so that instruments will be padded correctly.
+        note_sequence.total_time = (
+                total_bars * self._steps_per_bar *
+                60 / note_sequence.tempos[0].qpm / self._steps_per_quarter)
+        encoded_instruments = {}
+        encoded_chords = None
+        for i in (instruments_by_type[self.InstrumentType.MEL] +
+                  instruments_by_type[self.InstrumentType.BASS]):
+            tensors = self._melody_converter.to_tensors(
+                _extract_instrument(note_sequence, i))
+            if tensors.outputs:
+                encoded_instruments[i] = tensors.outputs[0]
+                if encoded_chords is None:
+                    encoded_chords = tensors.controls[0]
+                elif not np.array_equal(encoded_chords, tensors.controls[0]):
+                    tf.logging.warning('Trio chords disagreement between instruments.')
+            else:
+                coverage[:, i] = False
+                
+        for i in instruments_by_type[self.InstrumentType.DRUMS]:
+            tensors = self._drums_converter.to_tensors(
+                _extract_instrument(note_sequence, i))
+            if tensors.outputs:
+                encoded_instruments[i] = tensors.outputs[0]
+            else:
+                coverage[:, i] = False
+
+        # Fill in coverage gaps up to self._gap_bars.
+        og_coverage = coverage.copy()
+        for j in range(total_bars):
+            coverage[j] = np.any(
+                og_coverage[
+                max(0, j - self._gap_bars):min(total_bars, j + self._gap_bars) + 1],
+                axis=0)
+
+        # Take cross product of instruments from each class and compute combined
+        # encodings where they overlap.
+        seqs = []
+        control_seqs = []
+        for grp in itertools.product(
+                instruments_by_type[self.InstrumentType.MEL],
+                instruments_by_type[self.InstrumentType.BASS],
+                instruments_by_type[self.InstrumentType.DRUMS]):
+            # Consider an instrument covered within gap_bars from the end if any of
+            # the other instruments are. This allows more leniency when re-encoding
+            # slices.
+            grp_coverage = np.all(coverage[:, grp], axis=1)
+            grp_coverage[:self._gap_bars] = np.any(coverage[:self._gap_bars, grp])
+            grp_coverage[-self._gap_bars:] = np.any(coverage[-self._gap_bars:, grp])
+            for j in range(total_bars - self._slice_bars + 1):
+                if (np.all(grp_coverage[j:j + self._slice_bars]) and
+                        all(i in encoded_instruments for i in grp)):
+                    start_step = j * self._steps_per_bar
+                    end_step = (j + self._slice_bars) * self._steps_per_bar
+                    seqs.append(np.concatenate(
+                        [encoded_instruments[i][start_step:end_step] for i in grp],
+                        axis=-1))
+                    if encoded_chords is not None:
+                        control_seqs.append(encoded_chords[start_step:end_step])
+
+        return ConverterTensors(inputs=seqs, outputs=seqs, controls=control_seqs)
+
+    def _to_notesequences(self, samples, controls=None):
+        print("Printing samples array shape: ", samples.shape)
+        output_sequences = []
+        dim_ranges = np.cumsum(self._split_output_depths)
+        print(dim_ranges)
+        for i, s in enumerate(samples):
+            mel_ns = self._melody_converter.to_notesequences(
+                [s[:, :dim_ranges[0]]],
+                [controls[i]] if controls is not None else None)[0]
+            bass_ns = self._melody_converter.to_notesequences(
+                [s[:, dim_ranges[0]:dim_ranges[1]]])[0]
+            drums_ns = self._drums_converter.to_notesequences(
+                [s[:, dim_ranges[1]:]])[0]
+
+            for n in bass_ns.notes:
+                n.instrument = 1
+                n.program = ELECTRIC_BASS_PROGRAM
+            for n in drums_ns.notes:
+                n.instrument = 9
+
+            ns = mel_ns
+            ns.notes.extend(bass_ns.notes)
+            ns.notes.extend(drums_ns.notes)
+            ns.total_time = max(
+                mel_ns.total_time, bass_ns.total_time, drums_ns.total_time)
+            output_sequences.append(ns)
+        return output_sequences
+
+
 class QuartetConverter(BaseNoteSequenceConverter):
     class InstrumentType(object):
         UNK = 0
-        CMEL = 1
+        C_MEL = 1
         MEL = 2
         BASS = 3
         DRUMS = 4
@@ -1798,10 +1802,11 @@ class QuartetConverter(BaseNoteSequenceConverter):
             self._melody_converter.output_depth,
             self._melody_converter.output_depth,
             self._drums_converter.output_depth)
+
         output_depth = sum(self._split_output_depths)
 
         self._program_map = dict(
-            [(i, QuartetConverter.InstrumentType.CMEL) for i in CMEL_PROGRAMS] +
+            [(i, QuartetConverter.InstrumentType.C_MEL) for i in CMEL_PROGRAMS] +
             [(i, QuartetConverter.InstrumentType.MEL) for i in MEL_PROGRAMS] +
             [(i, QuartetConverter.InstrumentType.BASS) for i in BASS_PROGRAMS])
 
@@ -1816,9 +1821,262 @@ class QuartetConverter(BaseNoteSequenceConverter):
             presplit_on_time_changes=True,
             max_tensors_per_notesequence=max_tensors_per_notesequence)
 
+    def parse_note_instruments(self, note, note_idx):
+        if note_idx > MAX_INSTRUMENT_NUMBER:
+            tf.logging.warning('Skipping invalid instrument number: %d', i)
+            return None
+        if note.is_drum:
+            inferred_type = self.InstrumentType.DRUMS
+        else:
+            inferred_type = self._program_map.get(note.program, self.InstrumentType.INVALID)
+        return inferred_type
+
     def _get_instruments_by_type(self, quantized_sequence, total_bars):
         instrument_type = np.zeros(MAX_INSTRUMENT_NUMBER + 1, np.uint8)
         coverage = np.zeros((total_bars, MAX_INSTRUMENT_NUMBER + 1), np.bool)
+        for note in quantized_sequence.notes:
+            note_idx = note.instrument
+            inferred_type = self.parse_note_instruments(note, note_idx)
+            if inferred_type is None:
+                continue
+
+            if instrument_type[note_idx] != inferred_type:
+                instrument_type[note_idx] = self.InstrumentType.INVALID
+            elif instrument_type[note_idx]:
+                instrument_type[note_idx] = inferred_type
+
+            start_bar = note.quantized_start_step // self._steps_per_bar
+            end_bar = int(np.ceil(note.quantized_end_step / self._steps_per_bar))
+
+            if start_bar >= total_bars:
+                continue
+            coverage[start_bar:min(end_bar, total_bars), note_idx] = True
+
+        # Group instruments by type.
+        instruments_by_type = collections.defaultdict(list)
+
+        for note_idx, type_ in enumerate(instrument_type):
+            if type_ not in (self.InstrumentType.UNK, self.InstrumentType.INVALID):
+                instruments_by_type[type_].append(note_idx)
+
+        return instruments_by_type, instrument_type, coverage
+
+    def _encode_instruments(self, note_sequence, total_bars, instruments_by_type, coverage):
+        note_sequence.total_time = (
+                    total_bars * self._steps_per_bar * 60 / note_sequence.tempos[0].qpm / self._steps_per_quarter)
+        encoded_instruments = {}
+        encoded_chords = None
+        print("encoding instruments: ", instruments_by_type)
+        all_instruments = instruments_by_type[self.InstrumentType.C_MEL] + instruments_by_type[self.InstrumentType.MEL] + instruments_by_type[self.InstrumentType.BASS]
+        for instrument in all_instruments:
+            tensors = self._melody_converter.to_tensors(_extract_instrument(note_sequence, instrument))
+            if tensors.outputs:
+                encoded_instruments[instrument] = tensors.outputs[0]
+                if encoded_chords is None:
+                    encoded_chords = tensors.controls[0]
+                elif not np.array_equal(encoded_chords, tensors.controls[0]):
+                    tf.logging.warning('Quartet chords disagreement between instruments.')
+            else:
+                coverage[:, instrument] = False
+
+        for instrument in instruments_by_type[self.InstrumentType.DRUMS]:
+            print("encoding drums voice for quartet converter")
+            tensors = self._drums_converter.to_tensors(
+                _extract_instrument(note_sequence, instrument))
+            if tensors.outputs:
+                encoded_instruments[instrument] = tensors.outputs[0]
+            else:
+                coverage[:, instrument] = False
+
+        return encoded_instruments, encoded_chords
+
+    def _build_sequences(self, instruments_by_type, coverage, total_bars, encoded_instruments, encoded_chords):
+        seqs = []
+        control_seqs = []
+        instrument_groups = itertools.product(
+            instruments_by_type[self.InstrumentType.C_MEL],
+            instruments_by_type[self.InstrumentType.MEL],
+            instruments_by_type[self.InstrumentType.BASS],
+            instruments_by_type[self.InstrumentType.DRUMS])
+
+        for instrument_group in instrument_groups:
+            group_coverage = np.all(coverage[:, instrument_group], axis=1)
+            group_coverage[:self._gap_bars] = np.any(coverage[:self._gap_bars, instrument_group])
+            group_coverage[-self._gap_bars:] = np.any(coverage[-self._gap_bars:, instrument_group])
+            for j in range(total_bars - self._slice_bars + 1):
+                if (np.all(group_coverage[j:j + self._slice_bars]) and
+                        all(i in encoded_instruments for i in instrument_group)):
+                    start_step = j * self._steps_per_bar
+                    end_step = (j + self._slice_bars) * self._steps_per_bar
+                    seqs.append(np.concatenate(
+                        [encoded_instruments[i][start_step:end_step] for i in instrument_group],
+                        axis=-1))
+                    if encoded_chords is not None:
+                        control_seqs.append(encoded_chords[start_step:end_step])
+
+        print("Encoded Sequences:", seqs, control_seqs)
+        return seqs, control_seqs
+
+    def _to_tensors(self, note_sequence):
+        try:
+            quantized_sequence = mm.quantize_note_sequence(note_sequence, self._steps_per_quarter)
+            if mm.steps_per_bar_in_quantized_sequence(quantized_sequence) != self._steps_per_bar:
+                return ConverterTensors()
+        except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError, mm.NegativeTimeError):
+            return ConverterTensors()
+
+        if self._chord_encoding and not any(ta.annotation_type == CHORD_SYMBOL for ta in quantized_sequence.text_annotations):
+            try:
+                mm.infer_chords_for_sequence(quantized_sequence)
+            except mm.ChordInferenceError:
+                print("Chord Inference Error during tensor encoding")
+                return ConverterTensors()
+
+            for quantized_annotation in quantized_sequence.text_annotations:
+                if quantized_annotation.annotation_type == CHORD_SYMBOL:
+                    text_annotation = note_sequence.text_annotations.add()
+                    text_annotation.annotation_type = CHORD_SYMBOL
+                    text_annotation.time = quantized_annotation.time
+                    text_annotation.text = quantized_annotation.text
+
+        total_bars = int(np.ceil(quantized_sequence.total_quantized_steps / self._steps_per_bar))
+        total_bars = min(total_bars, self._max_bars)
+
+        instruments_by_type, instrument_type, coverage = self._get_instruments_by_type(quantized_sequence, total_bars)
+
+        if len(instruments_by_type) < 4:
+            print("ERROR: The PROVIDED NOTESEQUENCE LACKS ALL FOUR VOICE TYPES")
+            return ConverterTensors()
+
+        encoded_instruments, encoded_chords = self._encode_instruments(note_sequence, total_bars, instruments_by_type, coverage)
+
+        og_coverage = coverage.copy()
+        for start_bar in range(total_bars):
+            left_gap_bound, right_gap_bound = [
+                max(0, start_bar - self._gap_bars),
+                min(total_bars, start_bar + self._gap_bars) + 1
+            ]
+            coverage[start_bar] = np.any(og_coverage[left_gap_bound:right_gap_bound], axis=0)
+
+        seqs, control_seqs = self._build_sequences(
+            instruments_by_type, coverage,
+            total_bars, encoded_instruments,
+            encoded_chords)
+
+        return ConverterTensors(inputs=seqs, outputs=seqs, controls=control_seqs)
+
+    def _to_notesequences(self, samples, controls=None):
+        output_sequences = []
+        dim_ranges = np.cumsum(self._split_output_depths)
+        for idx, samples in enumerate(samples):
+            control = [controls[idx]] if controls is not None else None
+            counter_melody_ns = self._melody_converter.to_notesequences([samples[:, :dim_ranges[0]]], control)[0]
+            mel_ns = self._melody_converter.to_notesequences([samples[:, dim_ranges[0]:dim_ranges[1]]], control)[0]
+            bass_ns = self._melody_converter.to_notesequences([samples[:, dim_ranges[1]:dim_ranges[2]]])[0]
+            drums_ns = self._drums_converter.to_notesequences([samples[:, dim_ranges[2]:]])[0]
+            print("PRINTING EXTRACTED NOTESEQUENCES")
+            print(counter_melody_ns.notes)
+            print(mel_ns.notes)
+            print(bass_ns.notes)
+            print(drums_ns.notes)
+
+            for n in counter_melody_ns.notes:
+                n.instrument = 1
+                n.program = 50
+            for n in mel_ns.notes:
+                n.instrument = 2
+                n.program = 27
+            for n in bass_ns.notes:
+                n.instrument = 3
+                n.program = 33
+            for n in drums_ns.notes:
+                n.instrument = 9
+
+            ns = counter_melody_ns
+            ns.notes.extend(mel_ns.notes)
+            ns.notes.extend(bass_ns.notes)
+            ns.notes.extend(drums_ns.notes)
+            ns.total_time = max(counter_melody_ns.total_time, mel_ns.total_time, bass_ns.total_time, drums_ns.total_time)
+            output_sequences.append(ns)
+
+        return output_sequences
+
+
+class QuartetConverterDebug(BaseNoteSequenceConverter):
+    class InstrumentType(object):
+        UNK = 0
+        C_MEL = 1
+        MEL = 2
+        BASS = 3
+        DRUMS = 4
+        INVALID = 5
+
+    def __init__(self, slice_bars=None, gap_bars=2, max_bars=1024, steps_per_quarter=4,
+            quarters_per_bar=4, max_tensors_per_notesequence=5, chord_encoding=None):
+        self._melody_converter = OneHotMelodyConverter(
+            gap_bars=None, steps_per_quarter=steps_per_quarter,
+            pad_to_total_time=True, presplit_on_time_changes=False,
+            max_tensors_per_notesequence=None, chord_encoding=chord_encoding)
+        self._drums_converter = DrumsConverter(
+            gap_bars=None, steps_per_quarter=steps_per_quarter,
+            pad_to_total_time=True, presplit_on_time_changes=False,
+            max_tensors_per_notesequence=None)
+        self._slice_bars = slice_bars
+        self._gap_bars = gap_bars
+        self._max_bars = max_bars
+        self._steps_per_quarter = steps_per_quarter
+        self._steps_per_bar = steps_per_quarter * quarters_per_bar
+        self._chord_encoding = chord_encoding
+
+        self._split_output_depths = (
+            self._melody_converter.output_depth,
+            self._melody_converter.output_depth,
+            self._melody_converter.output_depth,
+            self._drums_converter.output_depth)
+        output_depth = sum(self._split_output_depths)
+
+        self._program_map = dict(
+            [(i, QuartetConverterDebug.InstrumentType.SYNTH) for i in CMEL_PROGRAMS] +
+            [(i, QuartetConverterDebug.InstrumentType.MEL) for i in MEL_PROGRAMS] +
+            [(i, QuartetConverterDebug.InstrumentType.BASS) for i in BASS_PROGRAMS])
+
+        super(QuartetConverterDebug, self).__init__(
+            input_depth=output_depth,
+            input_dtype=np.bool,
+            output_depth=output_depth,
+            output_dtype=np.bool,
+            control_depth=self._melody_converter.control_depth,
+            control_dtype=self._melody_converter.control_dtype,
+            end_token=False,
+            presplit_on_time_changes=True,
+            max_tensors_per_notesequence=max_tensors_per_notesequence)
+
+    def _to_tensors(self, note_sequence):
+        try:
+            quantized_sequence = mm.quantize_note_sequence(note_sequence, self._steps_per_quarter)
+            if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=self._steps_per_bar):
+                return ConverterTensors()
+        except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
+                mm.NegativeTimeError):
+            return ConverterTensors()
+
+        if self._chord_encoding and not any(ta.annotation_type == CHORD_SYMBOL for ta in quantized_sequence.text_annotations):
+            try:
+                mm.infer_chords_for_sequence(quantized_sequence)
+            except mm.ChordInferenceError:
+                return ConverterTensors()
+            for qta in quantized_sequence.text_annotations:
+                if qta.annotation_type == CHORD_SYMBOL:
+                    ta = note_sequence.text_annotations.add()
+                    ta.annotation_type = CHORD_SYMBOL
+                    ta.time = qta.time
+                    ta.text = qta.text
+
+        total_bars = int(np.ceil(quantized_sequence.total_quantized_steps / self._steps_per_bar))
+        total_bars = min(total_bars, self._max_bars)
+        instrument_type = np.zeros(MAX_INSTRUMENT_NUMBER + 1, np.uint8)
+        coverage = np.zeros((total_bars, MAX_INSTRUMENT_NUMBER + 1), np.bool)
+
         for note in quantized_sequence.notes:
             i = note.instrument
             if i > MAX_INSTRUMENT_NUMBER:
@@ -1841,25 +2099,23 @@ class QuartetConverter(BaseNoteSequenceConverter):
                 continue
             coverage[start_bar:min(end_bar, total_bars), i] = True
 
-        # Group instruments by type.
         instruments_by_type = collections.defaultdict(list)
 
         for i, type_ in enumerate(instrument_type):
             if type_ not in (self.InstrumentType.UNK, self.InstrumentType.INVALID):
                 instruments_by_type[type_].append(i)
+        if len(instruments_by_type) < 4:
+            return ConverterTensors()
 
-        return instruments_by_type, instrument_type, coverage
-
-    def _encode_instruments(self, note_sequence, total_bars, instruments_by_type, coverage):
-        note_sequence.total_time = (
-                    total_bars * self._steps_per_bar * 60 / note_sequence.tempos[0].qpm / self._steps_per_quarter)
+        # Encode individual instruments.
+        # Set total time so that instruments will be padded correctly.
+        note_sequence.total_time = (total_bars * self._steps_per_bar * 60 / note_sequence.tempos[0].qpm / self._steps_per_quarter)
         encoded_instruments = {}
         encoded_chords = None
-        for i in (instruments_by_type[self.InstrumentType.CMEL] +
+        for i in (instruments_by_type[self.InstrumentType.C_MEL] +
                   instruments_by_type[self.InstrumentType.MEL] +
                   instruments_by_type[self.InstrumentType.BASS]):
-            tensors = self._melody_converter.to_tensors(
-                _extract_instrument(note_sequence, i))
+            tensors = self._melody_converter.to_tensors(_extract_instrument(note_sequence, i))
             if tensors.outputs:
                 encoded_instruments[i] = tensors.outputs[0]
                 if encoded_chords is None:
@@ -1868,7 +2124,6 @@ class QuartetConverter(BaseNoteSequenceConverter):
                     tf.logging.warning('Quartet chords disagreement between instruments.')
             else:
                 coverage[:, i] = False
-
         for i in instruments_by_type[self.InstrumentType.DRUMS]:
             tensors = self._drums_converter.to_tensors(
                 _extract_instrument(note_sequence, i))
@@ -1877,17 +2132,20 @@ class QuartetConverter(BaseNoteSequenceConverter):
             else:
                 coverage[:, i] = False
 
-        return encoded_instruments, encoded_chords
+        og_coverage = coverage.copy()
+        for j in range(total_bars):
+            coverage[j] = np.any(
+                og_coverage[
+                max(0, j - self._gap_bars):min(total_bars, j + self._gap_bars) + 1],
+                axis=0)
 
-    def _build_sequences(self, instruments_by_type, coverage, total_bars, encoded_instruments, encoded_chords):
         seqs = []
         control_seqs = []
         for grp in itertools.product(
-                instruments_by_type[self.InstrumentType.CMEL],
+                instruments_by_type[self.InstrumentType.C_MEL],
                 instruments_by_type[self.InstrumentType.MEL],
                 instruments_by_type[self.InstrumentType.BASS],
                 instruments_by_type[self.InstrumentType.DRUMS]):
-
             grp_coverage = np.all(coverage[:, grp], axis=1)
             grp_coverage[:self._gap_bars] = np.any(coverage[:self._gap_bars, grp])
             grp_coverage[-self._gap_bars:] = np.any(coverage[-self._gap_bars:, grp])
@@ -1902,65 +2160,13 @@ class QuartetConverter(BaseNoteSequenceConverter):
                     if encoded_chords is not None:
                         control_seqs.append(encoded_chords[start_step:end_step])
 
-        return seqs, control_seqs
-
-    def _to_tensors(self, note_sequence):
-        try:
-            quantized_sequence = mm.quantize_note_sequence(
-                note_sequence, self._steps_per_quarter)
-            if (mm.steps_per_bar_in_quantized_sequence(quantized_sequence) !=
-                    self._steps_per_bar):
-                return ConverterTensors()
-        except (mm.BadTimeSignatureError, mm.NonIntegerStepsPerBarError,
-                mm.NegativeTimeError):
-            return ConverterTensors()
-
-        if self._chord_encoding and not any(
-                ta.annotation_type == CHORD_SYMBOL
-                for ta in quantized_sequence.text_annotations):
-            try:
-                mm.infer_chords_for_sequence(quantized_sequence)
-            except mm.ChordInferenceError:
-                return ConverterTensors()
-
-            for qta in quantized_sequence.text_annotations:
-                if qta.annotation_type == CHORD_SYMBOL:
-                    ta = note_sequence.text_annotations.add()
-                    ta.annotation_type = CHORD_SYMBOL
-                    ta.time = qta.time
-                    ta.text = qta.text
-
-        total_bars = int(np.ceil(quantized_sequence.total_quantized_steps / self._steps_per_bar))
-        total_bars = min(total_bars, self._max_bars)
-
-        instruments_by_type, instrument_type, coverage = self._get_instruments_by_type(quantized_sequence, total_bars)
-
-        if len(instruments_by_type) < 4:
-            # This NoteSequence doesn't have all four voice types.
-            return ConverterTensors()
-
-        encoded_instruments, encoded_chords = self._encode_instruments(note_sequence, total_bars, instrument_type,
-                                                                       coverage)
-
-        og_coverage = coverage.copy()
-        for j in range(total_bars):
-            coverage[j] = np.any(
-                og_coverage[
-                max(0, j - self._gap_bars):min(total_bars, j + self._gap_bars) + 1],
-                axis=0)
-
-        seqs, control_seqs = self._build_sequences(
-            instruments_by_type, coverage,
-            total_bars, encoded_instruments,
-            encoded_chords)
-
         return ConverterTensors(inputs=seqs, outputs=seqs, controls=control_seqs)
 
     def _to_notesequences(self, samples, controls=None):
         output_sequences = []
         dim_ranges = np.cumsum(self._split_output_depths)
         for i, s in enumerate(samples):
-            countermel_ns = self._melody_converter.to_notesequences(
+            counter_melody_ns = self._melody_converter.to_notesequences(
                 [s[:, :dim_ranges[0]]],
                 [controls[i]] if controls is not None else None)[0]
             mel_ns = self._melody_converter.to_notesequences(
@@ -1971,9 +2177,9 @@ class QuartetConverter(BaseNoteSequenceConverter):
             drums_ns = self._drums_converter.to_notesequences(
                 [s[:, dim_ranges[2]:]])[0]
 
-            for n in countermel_ns.notes:
+            for n in counter_melody_ns.notes:
                 n.instrument = 1
-                n.program = 89
+                n.program = 50
             for n in mel_ns.notes:
                 n.instrument = 2
                 n.program = 27
@@ -1983,12 +2189,11 @@ class QuartetConverter(BaseNoteSequenceConverter):
             for n in drums_ns.notes:
                 n.instrument = 9
 
-            ns = countermel_ns
+            ns = counter_melody_ns
             ns.notes.extend(mel_ns.notes)
             ns.notes.extend(bass_ns.notes)
             ns.notes.extend(drums_ns.notes)
-            ns.total_time = max(
-                countermel_ns.total_time, mel_ns.total_time, bass_ns.total_time, drums_ns.total_time)
+            ns.total_time = max(counter_melody_ns.total_time, mel_ns.total_time, bass_ns.total_time, drums_ns.total_time)
             output_sequences.append(ns)
 
         return output_sequences

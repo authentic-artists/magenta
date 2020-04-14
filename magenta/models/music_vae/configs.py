@@ -505,7 +505,9 @@ CONFIG_MAP['hier-quartet_4bar'] = Config(
                     512,  # drums
                 ]),
             level_lengths=[8, 8],
-            disable_autoregression=True)),
+            disable_autoregression=True
+        )
+    ),
     hparams=merge_hparams(
         lstm_models.get_default_hparams(),
         HParams(
@@ -516,7 +518,8 @@ CONFIG_MAP['hier-quartet_4bar'] = Config(
             dec_rnn_size=[512, 512],
             free_bits=256,
             max_beta=0.2,
-        )),
+        )
+    ),
     note_sequence_augmenter=None,
     data_converter=quartet_4bar_converter,
     train_examples_path=None,
@@ -526,13 +529,15 @@ CONFIG_MAP['hier-quartet_4bar'] = Config(
     ns_converter_name='quartet_4bar_converter'
 )
 
-quartet_4bar_converter = data.QuartetConverter(
+quartet_4bar_converter_debug = data.QuartetConverterDebug(
     steps_per_quarter=4,
     slice_bars=4,
     gap_bars=2)
 
-CONFIG_MAP['hierdec-quartet_4bar'] = Config(
+CONFIG_MAP['hier-quartet_4bardbug'] = Config(
     model=MusicVAE(
+        lstm_models.HierarchicalLstmEncoder(
+            lstm_models.BidirectionalLstmEncoder, [8, 8]),
         lstm_models.HierarchicalLstmDecoder(
             lstm_models.SplitMultiOutLstmDecoder(
                 core_decoders=[
@@ -547,7 +552,9 @@ CONFIG_MAP['hierdec-quartet_4bar'] = Config(
                     512,  # drums
                 ]),
             level_lengths=[8, 8],
-            disable_autoregression=True)),
+            disable_autoregression=True
+        )
+    ),
     hparams=merge_hparams(
         lstm_models.get_default_hparams(),
         HParams(
@@ -558,14 +565,16 @@ CONFIG_MAP['hierdec-quartet_4bar'] = Config(
             dec_rnn_size=[512, 512],
             free_bits=256,
             max_beta=0.2,
-        )),
+        )
+    ),
     note_sequence_augmenter=None,
-    data_converter=quartet_4bar_converter,
+    data_converter=quartet_4bar_converter_debug,
     train_examples_path=None,
     eval_examples_path=None,
     signatures=['sample', 'interpolate'],
     architecture_name='music_vae',
-    ns_converter_name='quartet_4bar_converter')
+    ns_converter_name='quartet_4bar_converter'
+)
 
 # Multitrack
 multiperf_encoder = lstm_models.HierarchicalLstmEncoder(

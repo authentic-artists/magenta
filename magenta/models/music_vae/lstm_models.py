@@ -257,7 +257,7 @@ class HierarchicalLstmEncoder(base_model.BaseEncoder):
 
     for level, (num_splits, h_encoder) in enumerate(
         self._hierarchical_encoders):
-      split_seqs = tf.split(sequence, num_splits, axis=1)
+      split_seqs = tf.split(sequence, int(num_splits), axis=1)
       # In the first level, we use the input `sequence_length`. After that,
       # we use the full embedding sequences.
       if level:
